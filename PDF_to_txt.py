@@ -1,202 +1,154 @@
 import io
 import re
-import zipfile
 from datetime import datetime
 
 import nltk
-from spellchecker import SpellChecker
+import pandas as pd
 import streamlit as st
+from spellchecker import SpellChecker
 
 # -------------------- NLTK 준비 -------------------- #
 def _ensure_nltk():
-    """NLTK 데이터 다운로드 및 검증"""
-    required_packages = ["punkt", "punkt_tab"]
+    """NLTK 데이터 다운로드 및 검증 (토크나이저 + 품사 태거)"""
+    required_resources = [
+        ("tokenizers/punkt", "punkt", True),
+        ("tokenizers/punkt_tab", "punkt_tab", False),
+        ("taggers/averaged_perceptron_tagger", "averaged_perceptron_tagger", True),
+        ("taggers/averaged_perceptron_tagger_eng", "averaged_perceptron_tagger_eng", False),
+    ]
 
-    for package in required_packages:
+    for path, package, required in required_resources:
         try:
-            nltk.data.find(f"tokenizers/{package}")
+            nltk.data.find(path)
         except (LookupError, OSError):
             try:
+                st.write(f"Downloading NLTK '{package}'...")
                 nltk.download(package, quiet=True)
             except Exception as e:
-                if package == "punkt":
-                    raise Exception(f"Failed to download required NLTK data: {e}")
+                if required:
+                    raise Exception(f"Failed to download required NLTK data '{package}': {e}")
                 else:
-                    print(f"Warning: Could not download {package}, continuing anyway...")
+                    st.write(f"Warning: Could not download optional NLTK data '{package}': {e}")
 
 
-_ensure_nltk()
-
-# -------------------- 핵심 함수 -------------------- #
 _WORD_RE = re.compile(r"^[A-Za-z][A-Za-z'-]*$")
 
 
 def analyze_spelling(text, spell_checker):
+    """
+    텍스트에서 스펠링 오류를 탐지하고,
+    각 오류에 대해 (교정어, 품사 태그, 전체 오류 개수)를 반환.
+    - corrections: {단어(lower): 교정어}
+    - pos_map: {단어(lower): 품사 태그 문자열}
+    """
     words = nltk.word_tokenize(text)
     tokens = [w for w in words if _WORD_RE.match(w)]
     lowers = [w.lower() for w in tokens]
+
     misspelled = spell_checker.unknown(lowers)
-    corrections = {w: spell_checker.correction(w) for w in misspelled}
-    return corrections, len(misspelled)
 
+    tagged = nltk.pos_tag(tokens)
 
-def correct_spelling(text, spell_checker):
-    words = nltk.word_tokenize(text)
-    out = []
+    pos_counts = {}
+    for tok, tag in tagged:
+        key = tok.lower()
+        if key not in pos_counts:
+            pos_counts[key] = {}
+        pos_counts[key][tag] = pos_counts[key].get(tag, 0) + 1
 
-    for tok in words:
-        if _WORD_RE.match(tok):
-            # 전부 대문자인 단어(약어 등)는 건드리지 않기 (선택적 정책)
-            if tok.isupper():
-                out.append(tok)
-                continue
-
-            corr = spell_checker.correction(tok.lower()) or tok
-            if tok[:1].isupper():
-                corr = corr.capitalize()
-            out.append(corr)
+    pos_map = {}
+    for w in misspelled:
+        tag_dict = pos_counts.get(w, {})
+        if tag_dict:
+            best_tag = max(tag_dict.items(), key=lambda x: x[1])[0]
+            pos_map[w] = best_tag
         else:
-            out.append(tok)
+            pos_map[w] = ""
 
-    s = " ".join(out)
-
-    # 구두점 앞 공백 제거
-    for p in [",", ".", "!", "?", ":", ";"]:
-        s = s.replace(f" {p}", p)
-
-    return s
+    corrections = {w: spell_checker.correction(w) for w in misspelled}
+    return corrections, pos_map, len(misspelled)
 
 
-def decode_bytes_with_fallback(data: bytes) -> str:
-    """여러 인코딩 시도해서 텍스트 디코딩"""
-    for enc in ("utf-8", "cp949", "euc-kr", "latin-1"):
-        try:
-            return data.decode(enc)
-        except (UnicodeDecodeError, LookupError):
-            continue
-    # 마지막 수단: latin-1로 강제 디코딩
-    return data.decode("latin-1", errors="replace")
+@st.cache_resource
+def get_spellchecker():
+    _ensure_nltk()
+    return SpellChecker()
 
 
-# -------------------- Streamlit UI -------------------- #
-st.set_page_config(
-    page_title="YONSEI SPELLING DETECT TOOL",
-    layout="wide",
-)
+def main():
+    st.set_page_config(
+        page_title="YONSEI SPELLING DETECT TOOL",
+        layout="wide",
+    )
 
-st.title("YONSEI SPELLING DETECT TOOL")
-st.caption("Batch English spelling detection & correction tool for .txt files (Yonsei ver.)")
+    st.title("YONSEI SPELLING DETECT TOOL")
+    st.write(
+        "여러 개의 `.txt` 파일을 업로드하면, 스펠링 오류와 품사(Word Class), 교정어를 한 번에 확인할 수 있습니다."
+    )
 
-st.markdown(
-    """
-1. 좌측에서 하나 이상의 `.txt` 파일을 업로드합니다.  
-2. **Run Spell Check** 버튼을 누르면 스펠링 오류를 분석하고 교정합니다.  
-3. 결과:
-   - 중복 제거된 스펠링 오류 목록을 화면에 표시
-   - CSV로 다운로드
-   - 교정된 텍스트를 ZIP 파일로 묶어 다운로드
-"""
-)
+    uploaded_files = st.file_uploader(
+        "분석할 .txt 파일을 업로드하세요 (여러 개 선택 가능)", type=["txt"], accept_multiple_files=True
+    )
 
-uploaded_files = st.file_uploader(
-    "📂 Upload .txt files",
-    type=["txt"],
-    accept_multiple_files=True,
-    help="여러 개의 .txt 파일을 동시에 업로드할 수 있습니다.",
-)
+    run = st.button("🚀 Run Spelling Detection")
 
-run_button = st.button("🚀 Run Spell Check")
+    if run:
+        if not uploaded_files:
+            st.warning("먼저 .txt 파일을 하나 이상 업로드하세요.")
+            return
 
-if run_button:
-    if not uploaded_files:
-        st.error("적어도 하나의 .txt 파일을 업로드해 주세요.")
-    else:
-        spell = SpellChecker()
+        spell = get_spellchecker()
+        all_rows = []
 
-        dedup = {}
-        corrected_files = {}  # filename -> corrected_text
-        total_miss_count = 0
-
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-
-        num_files = len(uploaded_files)
+        progress = st.progress(0.0)
+        total = len(uploaded_files)
 
         for idx, uploaded in enumerate(uploaded_files, start=1):
-            filename = uploaded.name
-            raw_bytes = uploaded.read()
+            raw = uploaded.read()
 
-            # 인코딩 처리
-            text = decode_bytes_with_fallback(raw_bytes)
+            text = None
+            for enc in ("utf-8", "cp949", "euc-kr", "latin-1"):
+                try:
+                    text = raw.decode(enc)
+                    break
+                except UnicodeDecodeError:
+                    continue
 
-            # 스펠링 분석
-            errors, miss_count = analyze_spelling(text, spell)
-            total_miss_count += miss_count
+            if text is None:
+                st.warning(f"⚠️ {uploaded.name} - 인코딩 오류로 건너뜀")
+                progress.progress(idx / total)
+                continue
 
-            for w, c in errors.items():
-                if w not in dedup:
-                    dedup[w] = c
+            corrections, pos_map, miss_count = analyze_spelling(text, spell)
 
-            # 교정
-            fixed = correct_spelling(text, spell)
-            corrected_files[filename] = fixed
+            for err, corr in corrections.items():
+                all_rows.append(
+                    {
+                        "file": uploaded.name,
+                        "spelling_error": err,
+                        "word_class": pos_map.get(err, ""),
+                        "correction": corr if corr else "",
+                    }
+                )
 
-            progress = int(idx / num_files * 100)
-            progress_bar.progress(progress)
-            status_text.text(f"Processing {idx}/{num_files} - {filename} (found {miss_count} errors)")
+            progress.progress(idx / total)
 
-        # 결과 출력
-        st.success(
-            f"✅ 완료! {num_files}개 파일에서 총 {total_miss_count}개의 스펠링 오류를 발견했습니다.\n"
-            f"중복 제거된 고유한 오류 수: {len(dedup)}개"
+        if not all_rows:
+            st.info("스펠링 오류가 발견되지 않았거나, 분석 가능한 단어가 없습니다.")
+            return
+
+        df = pd.DataFrame(all_rows)
+        st.subheader("Detected Spelling Errors")
+        st.dataframe(df, use_container_width=True)
+
+        csv = df.to_csv(index=False, encoding="utf-8-sig")
+        st.download_button(
+            label="📊 Download CSV",
+            data=csv,
+            file_name=f"yonsei_spelling_errors_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
         )
 
-        # dedup 표 보여주기
-        if dedup:
-            st.subheader("📋 Unique Spelling Errors (중복 제거)")
-            table_data = [
-                {"Spelling Error": err, "Correction": corr if corr else "(수정 불가)"}
-                for err, corr in sorted(dedup.items())
-            ]
-            st.dataframe(table_data, use_container_width=True)
 
-            # CSV 다운로드 버튼
-            csv_buffer = io.StringIO()
-            csv_buffer.write("스펠링 오류,올바른 단어\n")
-            for err, corr in sorted(dedup.items()):
-                fixed_corr = corr if corr else "(수정 불가)"
-                # 콤마 처리(간단히 따옴표로 감싸기)
-                csv_buffer.write(f"\"{err}\",\"{fixed_corr}\"\n")
-
-            csv_bytes = csv_buffer.getvalue().encode("utf-8-sig")
-            st.download_button(
-                label="📊 Download Errors as CSV",
-                data=csv_bytes,
-                file_name=f"spelling_errors_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-            )
-
-        # 교정된 텍스트 ZIP 다운로드
-        if corrected_files:
-            st.subheader("📦 Corrected Files Download")
-
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                for fname, content in corrected_files.items():
-                    # 교정된 텍스트를 UTF-8로 저장
-                    zf.writestr(fname, content)
-
-            zip_buffer.seek(0)
-
-            st.download_button(
-                label="📥 Download Corrected Files (ZIP)",
-                data=zip_buffer,
-                file_name=f"corrected_txt_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                mime="application/zip",
-            )
-
-        # 요약
-        with st.expander("🔍 Summary"):
-            st.write(f"- 처리한 파일 수: **{num_files}개**")
-            st.write(f"- 총 발견된 스펠링 오류(중복 포함): **{total_miss_count}개**")
-            st.write(f"- 고유한 스펠링 오류 수(중복 제거): **{len(dedup)}개**")
+if __name__ == "__main__":
+    main()
